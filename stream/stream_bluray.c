@@ -118,6 +118,7 @@ struct bd_overlay_plane {
 
 struct bluray_priv_s {
     BLURAY *bd;
+    struct bluray_remote_io *remote_io;   /* lms: remote image I/O (URL) */
     struct mp_log *bluray_log;
     bool probing;               // open is an .iso auto-detection probe
     BLURAY_TITLE_INFO *title_info;
@@ -457,6 +458,104 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
+
+/* ---- lms patch: remote Blu-ray image support (streaming) -------------------------
+ *
+ * Why: libbluray only accepts a local path (so mpv cannot play an ISO over HTTP),
+ * but it exposes bd_open_stream() - which is exactly what VLC uses to play remote
+ * images. This patch routes a URL given to --bluray-device through bd_open_stream()
+ * and feeds it with mpv's own stream, i.e. *mpv* does the I/O:
+ *   - sequential reads stay on one long HTTP response => one request for the movie
+ *     (mpv's stream_seek() to the current position is a no-op, and forward skips
+ *      within the internal buffer are done by reading, not by seeking) - verified
+ *     against stream/stream.c.
+ *   - plus a read-ahead block cache below, because libbluray's *open* phase reads
+ *     scattered UDF metadata (index.bdmv / PLAYLIST / CLIPINF); every read that
+ *     falls outside the cache would otherwise be a new HTTP range request.
+ * Local paths keep the old bd_open() path unchanged.
+ * -------------------------------------------------------------------------------- */
+
+#define LMS_BD_IO_BUF      (8 * 1024 * 1024)   /* read-ahead window cap */
+#define LMS_BD_IO_MIN_READ (1 * 1024 * 1024)   /* never request less than this */
+
+struct bluray_remote_io {
+    struct stream *st;
+    mp_mutex lock;          /* libbluray may call the callback from other threads */
+    uint8_t *buf;
+    int64_t start;          /* byte offset of buf[0] */
+    size_t  len;            /* valid bytes in buf */
+    size_t  cap;            /* buf capacity in bytes */
+    /* stats (logged at close; used to judge the request pattern) */
+    int64_t n_calls, n_seeks, n_reads, n_bytes;
+};
+
+static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_blocks)
+{
+    struct bluray_priv_s *b = handle;
+    struct bluray_remote_io *io = b ? b->remote_io : NULL;
+    if (!io || num_blocks <= 0 || lba < 0)
+        return -1;
+
+    int64_t off  = (int64_t)lba * 2048;
+    size_t  want = (size_t)num_blocks * 2048;
+    int ret = -1;
+
+    mp_mutex_lock(&io->lock);
+    io->n_calls++;
+    while (want > 0) {
+        /* serve from the read-ahead buffer when covered */
+        if (off >= io->start && off < io->start + (int64_t)io->len) {
+            size_t skip  = (size_t)(off - io->start);
+            size_t avail = io->len - skip;
+            size_t n     = MPMIN(avail, want);
+            memcpy(buf, io->buf + skip, n);
+            buf = (uint8_t *)buf + n;
+            off += (int64_t)n;
+            want -= n;
+            io->n_bytes += (int64_t)n;
+            continue;
+        }
+        /* miss: contiguous with the buffer end -> keep reading (no request);
+         * otherwise seek once (this is the only place a new HTTP request can happen) */
+        bool append = (off == io->start + (int64_t)io->len) && io->len < io->cap;
+        if (!append) {
+            if (!stream_seek(io->st, off))
+                goto done;
+            io->start = off;
+            io->len   = 0;
+            io->n_seeks++;
+        }
+        size_t space = io->cap - io->len;
+        size_t chunk = MPMIN(space, MPMAX(want, (size_t)LMS_BD_IO_MIN_READ));
+        if (chunk == 0)
+            goto done;
+        int r = stream_read(io->st, io->buf + io->len, (int)chunk);
+        if (r <= 0)          /* 0 = EOF or error; do not pretend success */
+            goto done;
+        io->len += (size_t)r;
+        io->n_reads++;
+    }
+    ret = num_blocks;        /* libbluray/libudfread contract: blocks read, <0 on error */
+done:
+    mp_mutex_unlock(&io->lock);
+    return ret;
+}
+
+static void bluray_remote_io_free(stream_t *s, struct bluray_remote_io *io)
+{
+    if (!io)
+        return;
+    MP_VERBOSE(s, "lms-bd: remote image I/O: block_calls=%lld seeks=%lld "
+                  "stream_reads=%lld bytes=%lld\n",
+               (long long)io->n_calls, (long long)io->n_seeks,
+               (long long)io->n_reads, (long long)io->n_bytes);
+    if (io->st)
+        free_stream(io->st);
+    mp_mutex_destroy(&io->lock);
+    talloc_free(io->buf);
+    talloc_free(io);
+}
+
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -471,6 +570,10 @@ static void bluray_stream_close(stream_t *s)
             bd_register_argb_overlay_proc(priv->bd, NULL, NULL, NULL);
         }
         bd_close(priv->bd);
+    }
+    if (priv->remote_io) {
+        bluray_remote_io_free(s, priv->remote_io);
+        priv->remote_io = NULL;
     }
     mp_mutex_lock(&bluray_log_lock);
     // If we created the global log, unset it.
@@ -1214,14 +1317,48 @@ static int bluray_stream_open_internal(stream_t *s)
     mp_mutex_unlock(&bluray_log_lock);
 
     /* open device */
-    char *device_tmp = mp_get_user_path(NULL, s->global, device);
-    BLURAY *bd = bd_open(device_tmp, NULL);
-    talloc_free(device_tmp);
-    if (!bd) {
-        if (!b->probing)
-            MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
-        ret = STREAM_UNSUPPORTED;
-        goto err;
+    /* lms patch: --bluray-device 给的是 URL（远程蓝光镜像）→ 走 libbluray 的
+     * stream 接口，由 mpv 自己取数（顺序读 = 一条长连接 ✓ 不逐块发请求 ✓）；
+     * 本地路径原样走 bd_open()（行为零变化 ✓）。 */
+    BLURAY *bd = NULL;
+    if (strstr(device, "://")) {
+        struct bluray_remote_io *rio = talloc_zero(s, struct bluray_remote_io);
+        if (!rio) {
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+        rio->st = stream_create(device, STREAM_READ, s->cancel, s->global);
+        if (!rio->st) {
+            MP_ERR(s, "lms-bd: cannot open remote image stream: %s\n", device);
+            talloc_free(rio);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+        rio->cap   = LMS_BD_IO_BUF;
+        rio->buf   = talloc_array(rio, uint8_t, rio->cap);
+        rio->start = 0;
+        rio->len   = 0;
+        mp_mutex_init(&rio->lock);
+        b->remote_io = rio;
+        bd = bd_init();
+        if (!bd || !bd_open_stream(bd, b, bluray_remote_read_blocks)) {
+            MP_ERR(s, "lms-bd: bd_open_stream failed for remote image: %s\n", device);
+            if (bd)
+                bd_close(bd);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+        MP_INFO(s, "lms-bd: remote Blu-ray image opened (streaming): %s\n", device);
+    } else {
+        char *device_tmp = mp_get_user_path(NULL, s->global, device);
+        bd = bd_open(device_tmp, NULL);
+        talloc_free(device_tmp);
+        if (!bd) {
+            if (!b->probing)
+                MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
     }
     b->bd = bd;
 
