@@ -476,18 +476,26 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
  * Local paths keep the old bd_open() path unchanged.
  * -------------------------------------------------------------------------------- */
 
-#define LMS_BD_IO_BUF      (8 * 1024 * 1024)   /* read-ahead window cap */
-#define LMS_BD_IO_MIN_READ (1 * 1024 * 1024)   /* never request less than this */
+/* lms: a remote image is read through a few small, far-apart regions - libbluray walks
+ * the UDF/BDMV metadata near the start and the index near the end. Measured on a real
+ * disc: 117 seeks over two regions (2.0 MB at ~0.6 MB, 0.5 MB at ~86914 MB), bouncing
+ * between them. A single read-ahead window cannot hold both, so every bounce cost a
+ * fresh HTTP request (~3/s, the kind of pattern that trips rate limiting). Keep a small
+ * set of windows instead; a hit in a resident window costs nothing. */
+#define LMS_BD_IO_SLOTS    (4)                     /* windows kept resident */
+#define LMS_BD_IO_SLOT_SZ  (16 * 1024 * 1024)      /* bytes per window */
+#define LMS_BD_IO_PREFETCH (4 * 1024 * 1024)       /* fetch this much per fill */
 
 struct bluray_remote_io {
     struct stream *st;
     mp_mutex lock;          /* libbluray may call the callback from other threads */
-    uint8_t *buf;
-    int64_t start;          /* byte offset of buf[0] */
-    size_t  len;            /* valid bytes in buf */
-    size_t  cap;            /* buf capacity in bytes */
+    uint8_t *buf[LMS_BD_IO_SLOTS];
+    int64_t  start[LMS_BD_IO_SLOTS];   /* byte offset of buf[i][0] */
+    size_t   len[LMS_BD_IO_SLOTS];     /* valid bytes in buf[i] */
+    int64_t  used[LMS_BD_IO_SLOTS];    /* LRU stamp */
+    int64_t  clock;
     /* stats (logged at close; used to judge the request pattern) */
-    int64_t n_calls, n_seeks, n_reads, n_bytes;
+    int64_t n_calls, n_seeks, n_reads, n_hits, n_bytes;
 };
 
 static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_blocks)
@@ -504,37 +512,84 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
     mp_mutex_lock(&io->lock);
     io->n_calls++;
     while (want > 0) {
-        /* serve from the read-ahead buffer when covered */
-        if (off >= io->start && off < io->start + (int64_t)io->len) {
-            size_t skip  = (size_t)(off - io->start);
-            size_t avail = io->len - skip;
-            size_t n     = MPMIN(avail, want);
-            memcpy(buf, io->buf + skip, n);
-            buf = (uint8_t *)buf + n;
-            off += (int64_t)n;
-            want -= n;
-            io->n_bytes += (int64_t)n;
-            continue;
+        int slot = -1;
+
+        /* 1) a resident window that already covers this offset: no I/O at all */
+        for (int i = 0; i < LMS_BD_IO_SLOTS; i++) {
+            if (io->len[i] && off >= io->start[i] &&
+                off < io->start[i] + (int64_t)io->len[i]) {
+                slot = i;
+                break;
+            }
         }
-        /* miss: contiguous with the buffer end -> keep reading (no request);
-         * otherwise seek once (this is the only place a new HTTP request can happen) */
-        bool append = (off == io->start + (int64_t)io->len) && io->len < io->cap;
-        if (!append) {
-            if (!stream_seek(io->st, off))
+
+        /* 2) otherwise extend the window that ends exactly here (sequential read) */
+        if (slot < 0) {
+            for (int i = 0; i < LMS_BD_IO_SLOTS; i++) {
+                if (io->len[i] && io->start[i] + (int64_t)io->len[i] == off &&
+                    io->len[i] < LMS_BD_IO_SLOT_SZ) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+
+        /* 3) otherwise take a window: an empty one, else the least recently used */
+        if (slot < 0) {
+            for (int i = 0; i < LMS_BD_IO_SLOTS; i++) {
+                if (!io->len[i]) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < LMS_BD_IO_SLOTS; i++) {
+                if (io->used[i] < io->used[slot])
+                    slot = i;
+            }
+        }
+        if (slot < 0)
+            goto done;
+
+        bool covered = io->len[slot] && off >= io->start[slot] &&
+                       off < io->start[slot] + (int64_t)io->len[slot];
+        if (covered) {
+            io->n_hits++;
+        } else {
+            /* Anchor on the *region* the target falls in, not on the target itself:
+             * per-address anchors gave every bounce its own window and nothing was ever
+             * reused. PREFETCH alignment makes a whole region one window.
+             * (A new HTTP request can only happen in this branch.) */
+            int64_t anchor = off - (off % (int64_t)LMS_BD_IO_PREFETCH);
+            if (!stream_seek(io->st, anchor))
                 goto done;
-            io->start = off;
-            io->len   = 0;
+            io->start[slot] = anchor;
+            io->len[slot]   = 0;
             io->n_seeks++;
+
+            size_t chunk = MPMAX(want, (size_t)LMS_BD_IO_PREFETCH);
+            chunk = MPMIN(chunk, (size_t)LMS_BD_IO_SLOT_SZ);
+            int r = stream_read(io->st, io->buf[slot], (int)chunk);
+            if (r <= 0)          /* 0 = EOF or error; do not pretend success */
+                goto done;
+            io->len[slot]  = (size_t)r;
+            io->used[slot] = ++io->clock;
+            io->n_reads++;
         }
-        size_t space = io->cap - io->len;
-        size_t chunk = MPMIN(space, MPMAX(want, (size_t)LMS_BD_IO_MIN_READ));
-        if (chunk == 0)
+
+        /* copy out what this window can satisfy; the loop re-checks the rest */
+        if (off < io->start[slot] || off >= io->start[slot] + (int64_t)io->len[slot])
             goto done;
-        int r = stream_read(io->st, io->buf + io->len, (int)chunk);
-        if (r <= 0)          /* 0 = EOF or error; do not pretend success */
-            goto done;
-        io->len += (size_t)r;
-        io->n_reads++;
+        size_t skip  = (size_t)(off - io->start[slot]);
+        size_t avail = io->len[slot] - skip;
+        size_t n     = MPMIN(avail, want);
+        memcpy(buf, io->buf[slot] + skip, n);
+        buf = (uint8_t *)buf + n;
+        off += (int64_t)n;
+        want -= n;
+        io->n_bytes += (int64_t)n;
     }
     ret = num_blocks;        /* libbluray/libudfread contract: blocks read, <0 on error */
 done:
@@ -547,13 +602,14 @@ static void bluray_remote_io_free(stream_t *s, struct bluray_remote_io *io)
     if (!io)
         return;
     MP_VERBOSE(s, "lms-bd: remote image I/O: block_calls=%lld seeks=%lld "
-                  "stream_reads=%lld bytes=%lld\n",
+                  "stream_reads=%lld hits=%lld bytes=%lld\n",
                (long long)io->n_calls, (long long)io->n_seeks,
-               (long long)io->n_reads, (long long)io->n_bytes);
+               (long long)io->n_reads, (long long)io->n_hits, (long long)io->n_bytes);
     if (io->st)
         free_stream(io->st);
     mp_mutex_destroy(&io->lock);
-    talloc_free(io->buf);
+    for (int i = 0; i < LMS_BD_IO_SLOTS; i++)
+        talloc_free(io->buf[i]);
     talloc_free(io);
 }
 
@@ -1343,10 +1399,13 @@ static int bluray_stream_open_internal(stream_t *s)
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
-        rio->cap   = LMS_BD_IO_BUF;
-        rio->buf   = talloc_array(rio, uint8_t, rio->cap);
-        rio->start = 0;
-        rio->len   = 0;
+        for (int i = 0; i < LMS_BD_IO_SLOTS; i++) {
+            rio->buf[i]   = talloc_array(rio, uint8_t, LMS_BD_IO_SLOT_SZ);
+            rio->start[i] = 0;
+            rio->len[i]   = 0;
+            rio->used[i]  = 0;
+        }
+        rio->clock = 0;
         mp_mutex_init(&rio->lock);
         b->remote_io = rio;
         bd = bd_init();
