@@ -484,7 +484,7 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
  * fresh HTTP request (~3/s, the kind of pattern that trips rate limiting). Keep a small
  * set of windows instead; a hit in a resident window costs nothing. */
 #define LMS_BD_IO_SLOTS    (4)                     /* windows kept resident */
-#define LMS_BD_IO_SLOT_SZ  (16 * 1024 * 1024)      /* bytes per window */
+#define LMS_BD_IO_SLOT_SZ  (32 * 1024 * 1024)      /* bytes per window */
 #define LMS_BD_IO_PREFETCH (4 * 1024 * 1024)       /* fetch this much per fill */
 /* Minimum wall-clock gap between two real requests. Two fills can otherwise happen
  * back to back (measured: 2 requests within 0.7 s = 2.8/s) which is a burst even
@@ -501,6 +501,7 @@ struct bluray_remote_io {
     int64_t  used[LMS_BD_IO_SLOTS];    /* LRU stamp */
     int64_t  clock;
     int64_t  last_req_ns;   /* mp_time_ns() of the last real request */
+    int64_t  next_off;      /* offset the caller will most likely want next */
     /* stats (logged at close; used to judge the request pattern) */
     int64_t n_calls, n_seeks, n_reads, n_hits, n_bytes;
 };
@@ -569,23 +570,40 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
              * per-address anchors gave every bounce its own window and nothing was ever
              * reused. PREFETCH alignment makes a whole region one window.
              * (A new HTTP request can only happen in this branch.) */
-            /* keep a minimum gap between requests so even the first fills are not a burst */
-            int64_t now_ns = mp_time_ns();
-            if (io->last_req_ns) {
-                int64_t wait = LMS_BD_IO_MIN_GAP_NS - (now_ns - io->last_req_ns);
-                if (wait > 0)
-                    mp_sleep_ns(wait);
-            }
-            io->last_req_ns = mp_time_ns();
-
             int64_t anchor = off - (off % (int64_t)LMS_BD_IO_PREFETCH);
+            /* No jump means the window simply ran out: that is playback, and its rate is
+             * already paced by the bitrate (~3.8 MB/s on a UHD disc, so a refill every few
+             * seconds). Sleeping there only stutters the video - which is exactly what a 1 s
+             * sleep per window caused. Throttle only scattered seeks: opening the disc
+             * bounces between far-apart metadata regions and can fire a burst. */
+            /* "Sequential" = the caller is moving forward from where we left it, which is
+             * what playback does. Exact equality is too strict (the caller may ask for a
+             * slightly different block size, or skip a few KB), and the opening phase is
+             * recognisable by big or backward jumps. */
+            bool sequential = off >= io->next_off &&
+                              off - io->next_off <= (int64_t)LMS_BD_IO_PREFETCH;
+            if (!sequential) {
+                int64_t now_ns = mp_time_ns();
+                if (io->last_req_ns) {
+                    int64_t wait = LMS_BD_IO_MIN_GAP_NS - (now_ns - io->last_req_ns);
+                    if (wait > 0)
+                        mp_sleep_ns(wait);
+                }
+                io->last_req_ns = mp_time_ns();
+            }
             if (!stream_seek(io->st, anchor))
                 goto done;
             io->start[slot] = anchor;
             io->len[slot]   = 0;
             io->n_seeks++;
 
-            size_t chunk = MPMAX(want, (size_t)LMS_BD_IO_PREFETCH);
+            /* Opening the disc reads scattered metadata: a few MB is plenty there (the
+             * hot regions are 0.5 MB and 2.0 MB). Playback reads forward, and there the
+             * fetch should fill the whole window - reading only a few MB meant one request
+             * per MB, i.e. ~1 request/second on a UHD disc, which stutters. */
+            size_t fetch = sequential ? (size_t)LMS_BD_IO_SLOT_SZ
+                                      : (size_t)LMS_BD_IO_PREFETCH;
+            size_t chunk = MPMAX(want, fetch);
             chunk = MPMIN(chunk, (size_t)LMS_BD_IO_SLOT_SZ);
             int r = stream_read(io->st, io->buf[slot], (int)chunk);
             if (r <= 0)          /* 0 = EOF or error; do not pretend success */
@@ -606,6 +624,7 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
         off += (int64_t)n;
         want -= n;
         io->n_bytes += (int64_t)n;
+        io->next_off = off;
     }
     ret = num_blocks;        /* libbluray/libudfread contract: blocks read, <0 on error */
 done:
