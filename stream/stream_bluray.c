@@ -491,6 +491,8 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
  * though the average is tiny; 115 rate-limits on bursts. Sleeping here is cheap
  * because it happens at most a handful of times while the disc is opened. */
 #define LMS_BD_IO_MIN_GAP_NS (1000LL * 1000 * 1000)
+/* How many consecutive forward reads mean "the disc is open, this is playback". */
+#define LMS_BD_IO_PLAYBACK_RUNS (16)
 
 struct bluray_remote_io {
     struct stream *st;
@@ -502,8 +504,11 @@ struct bluray_remote_io {
     int64_t  clock;
     int64_t  last_req_ns;   /* mp_time_ns() of the last real request */
     int64_t  next_off;      /* offset the caller will most likely want next */
+    int      fwd_run;       /* consecutive forward reads (playback detection) */
+    bool     passthrough;   /* playback started: forward directly, no cache, no sleep */
+    int64_t  pos;           /* stream position while in passthrough */
     /* stats (logged at close; used to judge the request pattern) */
-    int64_t n_calls, n_seeks, n_reads, n_hits, n_bytes;
+    int64_t n_calls, n_seeks, n_reads, n_hits, n_bytes, n_direct, n_switched;
 };
 
 static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_blocks)
@@ -519,6 +524,32 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
 
     mp_mutex_lock(&io->lock);
     io->n_calls++;
+
+    /* Playback: from here on this behaves exactly like a plain file - one forward
+     * stream, no cache, no sleeps, no extra requests. The window cache exists only
+     * to absorb the scattered metadata scan while the disc is being opened. */
+    if (io->passthrough) {
+        while (want > 0) {
+            if (io->pos != off) {
+                if (!stream_seek(io->st, off))
+                    goto done;
+                io->pos = off;
+                io->n_seeks++;
+            }
+            int r = stream_read(io->st, buf, (int)want);
+            if (r <= 0)          /* 0 = EOF or error; do not pretend success */
+                goto done;
+            io->pos += r;
+            buf = (uint8_t *)buf + r;
+            off += (int64_t)r;
+            want -= (size_t)r;
+            io->n_bytes += (int64_t)r;
+            io->n_direct++;
+        }
+        ret = num_blocks;
+        goto done;
+    }
+
     while (want > 0) {
         int slot = -1;
 
@@ -561,6 +592,22 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
         if (slot < 0)
             goto done;
 
+        /* Playback detection: forward reads that keep going mean the metadata scan is
+         * over. Switch to direct forwarding so nothing here can add latency or extra
+         * requests for the rest of the movie. */
+        if (io->next_off && off >= io->next_off &&
+            off - io->next_off <= (int64_t)LMS_BD_IO_PREFETCH) {
+            io->fwd_run++;
+            if (io->fwd_run >= LMS_BD_IO_PLAYBACK_RUNS) {
+                io->passthrough = true;
+                io->pos = io->next_off;
+                io->n_switched++;
+                continue;        /* re-enter the loop, now in passthrough mode */
+            }
+        } else {
+            io->fwd_run = 0;
+        }
+
         bool covered = io->len[slot] && off >= io->start[slot] &&
                        off < io->start[slot] + (int64_t)io->len[slot];
         if (covered) {
@@ -571,39 +618,27 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
              * reused. PREFETCH alignment makes a whole region one window.
              * (A new HTTP request can only happen in this branch.) */
             int64_t anchor = off - (off % (int64_t)LMS_BD_IO_PREFETCH);
-            /* No jump means the window simply ran out: that is playback, and its rate is
-             * already paced by the bitrate (~3.8 MB/s on a UHD disc, so a refill every few
-             * seconds). Sleeping there only stutters the video - which is exactly what a 1 s
-             * sleep per window caused. Throttle only scattered seeks: opening the disc
-             * bounces between far-apart metadata regions and can fire a burst. */
-            /* "Sequential" = the caller is moving forward from where we left it, which is
-             * what playback does. Exact equality is too strict (the caller may ask for a
-             * slightly different block size, or skip a few KB), and the opening phase is
-             * recognisable by big or backward jumps. */
-            bool sequential = off >= io->next_off &&
-                              off - io->next_off <= (int64_t)LMS_BD_IO_PREFETCH;
-            if (!sequential) {
-                int64_t now_ns = mp_time_ns();
-                if (io->last_req_ns) {
-                    int64_t wait = LMS_BD_IO_MIN_GAP_NS - (now_ns - io->last_req_ns);
-                    if (wait > 0)
-                        mp_sleep_ns(wait);
-                }
-                io->last_req_ns = mp_time_ns();
+
+            /* Throttle only this branch: opening the disc bounces between far-apart
+             * metadata regions and can fire a burst (measured 79 requests in 29 s).
+             * Playback never reaches here, so it is never delayed. */
+            int64_t now_ns = mp_time_ns();
+            if (io->last_req_ns) {
+                int64_t wait = LMS_BD_IO_MIN_GAP_NS - (now_ns - io->last_req_ns);
+                if (wait > 0)
+                    mp_sleep_ns(wait);
             }
+            io->last_req_ns = mp_time_ns();
+
             if (!stream_seek(io->st, anchor))
                 goto done;
             io->start[slot] = anchor;
             io->len[slot]   = 0;
             io->n_seeks++;
 
-            /* Opening the disc reads scattered metadata: a few MB is plenty there (the
-             * hot regions are 0.5 MB and 2.0 MB). Playback reads forward, and there the
-             * fetch should fill the whole window - reading only a few MB meant one request
-             * per MB, i.e. ~1 request/second on a UHD disc, which stutters. */
-            size_t fetch = sequential ? (size_t)LMS_BD_IO_SLOT_SZ
-                                      : (size_t)LMS_BD_IO_PREFETCH;
-            size_t chunk = MPMAX(want, fetch);
+            /* The metadata regions are tiny (0.5 MB / 2.0 MB), so a few MB per fill is
+             * plenty while opening. */
+            size_t chunk = MPMAX(want, (size_t)LMS_BD_IO_PREFETCH);
             chunk = MPMIN(chunk, (size_t)LMS_BD_IO_SLOT_SZ);
             int r = stream_read(io->st, io->buf[slot], (int)chunk);
             if (r <= 0)          /* 0 = EOF or error; do not pretend success */
