@@ -1328,7 +1328,15 @@ static int bluray_stream_open_internal(stream_t *s)
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
-        rio->st = stream_create(device, STREAM_READ, s->cancel, s->global);
+        /* STREAM_READ is 0, and stream_create() with flags 0 makes check_origin()
+         * return 0 for every stream that declares an origin (stream_curl is
+         * STREAM_ORIGIN_NET), so the URL is refused as STREAM_UNSAFE and no request is
+         * ever made. demux.c passes STREAM_READ | params->stream_flags; do the same,
+         * inheriting this stream's origin and defaulting to STREAM_ORIGIN_DIRECT. */
+        rio->st = stream_create(device,
+                                STREAM_READ | (s->stream_origin ? s->stream_origin
+                                                                : STREAM_ORIGIN_DIRECT),
+                                s->cancel, s->global);
         if (!rio->st) {
             MP_ERR(s, "lms-bd: cannot open remote image stream: %s\n", device);
             talloc_free(rio);
