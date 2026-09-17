@@ -47,6 +47,7 @@
 #include "options/options.h"
 #include "options/path.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "stream.h"
 #include "osdep/io.h"
 #include "sub/osd.h"
@@ -485,6 +486,11 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
 #define LMS_BD_IO_SLOTS    (4)                     /* windows kept resident */
 #define LMS_BD_IO_SLOT_SZ  (16 * 1024 * 1024)      /* bytes per window */
 #define LMS_BD_IO_PREFETCH (4 * 1024 * 1024)       /* fetch this much per fill */
+/* Minimum wall-clock gap between two real requests. Two fills can otherwise happen
+ * back to back (measured: 2 requests within 0.7 s = 2.8/s) which is a burst even
+ * though the average is tiny; 115 rate-limits on bursts. Sleeping here is cheap
+ * because it happens at most a handful of times while the disc is opened. */
+#define LMS_BD_IO_MIN_GAP_NS (1000LL * 1000 * 1000)
 
 struct bluray_remote_io {
     struct stream *st;
@@ -494,6 +500,7 @@ struct bluray_remote_io {
     size_t   len[LMS_BD_IO_SLOTS];     /* valid bytes in buf[i] */
     int64_t  used[LMS_BD_IO_SLOTS];    /* LRU stamp */
     int64_t  clock;
+    int64_t  last_req_ns;   /* mp_time_ns() of the last real request */
     /* stats (logged at close; used to judge the request pattern) */
     int64_t n_calls, n_seeks, n_reads, n_hits, n_bytes;
 };
@@ -562,6 +569,15 @@ static int bluray_remote_read_blocks(void *handle, void *buf, int lba, int num_b
              * per-address anchors gave every bounce its own window and nothing was ever
              * reused. PREFETCH alignment makes a whole region one window.
              * (A new HTTP request can only happen in this branch.) */
+            /* keep a minimum gap between requests so even the first fills are not a burst */
+            int64_t now_ns = mp_time_ns();
+            if (io->last_req_ns) {
+                int64_t wait = LMS_BD_IO_MIN_GAP_NS - (now_ns - io->last_req_ns);
+                if (wait > 0)
+                    mp_sleep_ns(wait);
+            }
+            io->last_req_ns = mp_time_ns();
+
             int64_t anchor = off - (off % (int64_t)LMS_BD_IO_PREFETCH);
             if (!stream_seek(io->st, anchor))
                 goto done;
@@ -1406,6 +1422,7 @@ static int bluray_stream_open_internal(stream_t *s)
             rio->used[i]  = 0;
         }
         rio->clock = 0;
+        rio->last_req_ns = 0;
         mp_mutex_init(&rio->lock);
         b->remote_io = rio;
         bd = bd_init();
