@@ -40,6 +40,7 @@
 #include "config.h"
 #include "mpv_talloc.h"
 #include "common/common.h"
+#include <inttypes.h>
 #include "common/msg.h"
 #include "misc/thread_tools.h"
 #include "options/m_config.h"
@@ -1240,6 +1241,39 @@ static bool check_disc_info(stream_t *s)
     return true;
 }
 
+/* lms patch: pure BD-J discs have no HDMV titles, so libbluray's main title is
+ * usually the menu / a short clip and bd_select_title() fails ("Couldn't start
+ * title '11'"). Pick the longest title instead - that is the feature, the same
+ * heuristic VLC and HandBrake use. Returns -1 when it cannot decide. */
+static int lms_longest_title(stream_t *s)
+{
+    struct bluray_priv_s *b = s->priv;
+    int best = -1;
+    uint64_t best_dur = 0;
+    for (int i = 0; i < b->num_titles; i++) {
+        if (b->title_to_playlist && b->title_to_playlist[i] == (uint32_t)-1)
+            continue;
+        BLURAY_TITLE_INFO *ti = bd_get_title_info(b->bd, i, 0);
+        if (!ti)
+            continue;
+        uint64_t dur = ti->duration;
+        int pl = ti->playlist;
+        bd_free_title_info(ti);
+        if (dur > best_dur) {
+            best_dur = dur;
+            best = i;
+            MP_VERBOSE(s, "lms-bd: candidate title %d (playlist %05d.mpls, %" PRIu64 " ticks)
+",
+                       i, pl, dur);
+        }
+    }
+    if (best >= 0)
+        MP_INFO(s, "lms-bd: BD-J disc -> playing longest title %d (%" PRIu64 " ticks, %.1f min)
+",
+                best, best_dur, (double)best_dur / 90000.0 / 60.0);
+    return best;
+}
+
 static void select_initial_title(stream_t *s, int title_guess) {
     struct bluray_priv_s *b = s->priv;
 
@@ -1327,13 +1361,7 @@ static int bluray_stream_open_internal(stream_t *s)
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
-        /* STREAM_READ is 0: without an origin flag check_origin() returns 0 and every URL
-         * capable stream is refused as STREAM_UNSAFE. Inherit this stream's origin
-         * (DIRECT when the user opened the image via loadfile), like demux.c does. */
-        rio->st = stream_create(device,
-                                STREAM_READ | (s->stream_origin ? s->stream_origin
-                                                                : STREAM_ORIGIN_DIRECT),
-                                s->cancel, s->global);
+        rio->st = stream_create(device, STREAM_READ, s->cancel, s->global);
         if (!rio->st) {
             MP_ERR(s, "lms-bd: cannot open remote image stream: %s\n", device);
             talloc_free(rio);
@@ -1442,7 +1470,15 @@ static int bluray_stream_open_internal(stream_t *s)
         MP_VERBOSE(s, "bdnav: HDMV entered; current title=%d\n",
                    b->current_title);
     } else {
-        select_initial_title(s, bd_get_main_title(bd));
+        int guess = bd_get_main_title(bd);
+        /* lms patch: a disc with no HDMV titles is BD-J only; libbluray's main
+         * title is then the menu, which cannot be started without a JVM. */
+        if (info->num_hdmv_titles == 0 && info->num_bdj_titles > 0) {
+            int longest = lms_longest_title(s);
+            if (longest >= 0)
+                guess = longest;
+        }
+        select_initial_title(s, guess);
     }
 
     // Angle selection is only valid once a playlist has been picked.
